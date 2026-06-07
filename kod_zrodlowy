@@ -1,0 +1,313 @@
+#include <Adafruit_NeoPixel.h>
+
+// KONFIGURACJA PINÓW
+const int ledBlue = 8; const int ledRed = 9;
+const int btnUP = 10; const int btnDOWN = A0; const int btnOK = A1;
+const int PIN_NEOPIXEL = A2;
+const int PIN_BUZZER = A4;
+const int NUMPIXELS = 8;
+Adafruit_NeoPixel panelLED(NUMPIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+
+// PINY DEKODERA CD4511
+const int PIN_A = 0;  // WEJSCIE 1 w CD4511
+const int PIN_B = 1;  // WEJSCIE 2 w CD4511
+const int PIN_C = 13; // WEJSCIE 3 w CD4511
+// WEJSCIE 4 w CD4511 jest na stałe podłączone do masy (GND)
+
+const int RS = 12; const int E = 11;
+const int DB4 = 6; const int DB5 = 5; const int DB6 = 4; const int DB7 = 3;
+
+// STRUKTURY I TYPY
+#define SENSOR_MAX 6
+#define SENSOR_PIR 1
+#define SENSOR_SWITCH 2
+
+struct Sensor { 
+  byte pin; 
+  byte type; 
+  bool violated; 
+  int lastState; 
+};
+
+Sensor sensors[SENSOR_MAX];
+int sensorCount = 0;
+
+// STANY SYSTEMU
+#define ALARM_DISARMED 0
+#define ALARM_ARMED 1
+#define ALARM_EXIT_DELAY 2
+#define ALARM_TRIGGERED 3
+#define SENSOR_VIOLATED 4
+
+int systemState = ALARM_DISARMED;
+int alarm_sense = 0;
+int currentMenuPos = 0;
+bool inMenu = false;
+bool inSensorList = false;
+bool inAddMode = false;
+int tempPin = 4; 
+
+int currentSensorIdx = 0;
+unsigned long lastActivityTime = 0;
+unsigned long exitTimer = 0;
+int countdownValue = 0;
+
+int lastUp = HIGH; int lastDown = HIGH; int lastOk = HIGH;
+unsigned long prevMillis = 0; bool blink = false;
+
+// DEKLARACJE FUNKCJI
+void checkSensors(); void handleButtons(); void displayMenu(); void displaySensorList();
+void displayMainScreen(); void updateVisuals(); void executeAction(); void LCD_Init4bit();
+void LCD_WriteCommand4Bits(byte d); void LCD_WriteData4Bits(byte d); void LCD_WriteText(const char *s);
+void displayAddScreen(); void addSensor(byte pin, byte type);
+void update7SegmentCD4511(int state);
+
+void addSensor(byte pin, byte type) {
+  if (sensorCount < SENSOR_MAX) {
+    sensors[sensorCount].pin = pin; 
+    sensors[sensorCount].type = type;
+    sensors[sensorCount].violated = false;
+    
+    if (pin == 2) {
+      pinMode(pin, INPUT); 
+    } else {
+      pinMode(pin, INPUT_PULLUP);
+    }
+    
+    sensors[sensorCount].lastState = digitalRead(pin);
+    sensorCount++;
+  }
+}
+
+void setup() {
+  panelLED.begin();
+  pinMode(ledBlue, OUTPUT); pinMode(ledRed, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(btnUP, INPUT_PULLUP); pinMode(btnDOWN, INPUT_PULLUP); pinMode(btnOK, INPUT_PULLUP);
+  
+  // Ustawienie pinów sterujących dekodera jako wyjścia
+  pinMode(PIN_A, OUTPUT);
+  pinMode(PIN_B, OUTPUT);
+  pinMode(PIN_C, OUTPUT);
+
+  pinMode(E, OUTPUT); pinMode(RS, OUTPUT);
+  pinMode(DB4, OUTPUT); pinMode(DB5, OUTPUT); pinMode(DB6, OUTPUT); pinMode(DB7, OUTPUT);
+  
+  LCD_Init4bit();
+
+  // Czujniki bazowe
+  addSensor(2, SENSOR_PIR);
+  addSensor(A3, SENSOR_SWITCH);
+  addSensor(A5, SENSOR_SWITCH);
+  addSensor(7, SENSOR_SWITCH); 
+
+  LCD_WriteCommand4Bits(0x01);
+  LCD_WriteCommand4Bits(0x80); LCD_WriteText("SYSTEM ALARMOWY ");
+  LCD_WriteCommand4Bits(0xC0); LCD_WriteText("START...        ");
+  delay(2000);
+}
+
+void loop() {
+  checkSensors();
+  handleButtons();
+  
+  if (systemState == ALARM_EXIT_DELAY) {
+    if (millis() - exitTimer >= 1000) {
+      exitTimer = millis();
+      countdownValue--;
+      tone(PIN_BUZZER, 1000, 50);
+      if (countdownValue <= 0) { 
+        systemState = ALARM_ARMED; 
+        alarm_sense = 0; 
+      }
+    }
+  }
+
+  if (inAddMode) displayAddScreen();
+  else if (inMenu) displayMenu();
+  else if (inSensorList) displaySensorList();
+  else displayMainScreen();
+
+  updateVisuals();
+}
+
+void checkSensors() {
+  bool anyViolated = false;
+  for (int i = 0; i < sensorCount; i++) {
+    int val = digitalRead(sensors[i].pin);
+    bool isCurrentlyViolated = (val == HIGH);
+
+    if (sensors[i].lastState == LOW && val == HIGH) {
+      if (systemState == ALARM_ARMED) {
+        if (sensors[i].pin == 2) { 
+          alarm_sense++;
+          if (alarm_sense >= 3) systemState = ALARM_TRIGGERED;
+        } else {
+          systemState = ALARM_TRIGGERED;
+        }
+      }
+    }
+    
+    sensors[i].violated = isCurrentlyViolated;
+    sensors[i].lastState = val;
+    if (sensors[i].violated) anyViolated = true;
+  }
+  
+  if (inSensorList && anyViolated) systemState = SENSOR_VIOLATED;
+  else if (inSensorList) systemState = ALARM_DISARMED;
+}
+
+void handleButtons() {
+  int u = digitalRead(btnUP); int d = digitalRead(btnDOWN); int o = digitalRead(btnOK);
+  
+  if (lastUp == HIGH && u == LOW) {
+    lastActivityTime = millis();
+    if (inAddMode) { tempPin++; if (tempPin > 19) tempPin = 2; }
+    else if (inSensorList) currentSensorIdx = (currentSensorIdx <= 0) ? sensorCount - 1 : currentSensorIdx - 1;
+    else { inMenu = true; currentMenuPos = (currentMenuPos <= 0) ? 3 : currentMenuPos - 1; }
+    LCD_WriteCommand4Bits(0x01);
+  }
+  
+  if (lastDown == HIGH && d == LOW) {
+    lastActivityTime = millis();
+    if (inAddMode) { tempPin--; if (tempPin < 2) tempPin = 19; }
+    else if (inSensorList) currentSensorIdx = (currentSensorIdx >= sensorCount - 1) ? 0 : currentSensorIdx + 1;
+    else { inMenu = true; currentMenuPos = (currentMenuPos >= 3) ? 0 : currentMenuPos + 1; }
+    LCD_WriteCommand4Bits(0x01);
+  }
+
+  if (lastOk == HIGH && o == LOW) {
+    lastActivityTime = millis();
+    if (inAddMode) {
+      addSensor(tempPin, SENSOR_SWITCH);
+      inAddMode = false; inMenu = true;
+      LCD_WriteCommand4Bits(0x01); LCD_WriteText("DODANO CZUJNIK!"); delay(1000);
+    }
+    else if (inSensorList) { inSensorList = false; inMenu = true; }
+    else executeAction();
+    LCD_WriteCommand4Bits(0x01);
+  }
+  
+  lastUp = u; lastDown = d; lastOk = o;
+
+  if ((inMenu || inSensorList || inAddMode) && (millis() - lastActivityTime > 12000)) {
+    inMenu = false; inSensorList = false; inAddMode = false; LCD_WriteCommand4Bits(0x01);
+  }
+}
+
+void executeAction() {
+  if (currentMenuPos == 0) { systemState = ALARM_EXIT_DELAY; countdownValue = 10; exitTimer = millis(); inMenu = false; } 
+  else if (currentMenuPos == 1) { systemState = ALARM_DISARMED; alarm_sense = 0; inMenu = false; noTone(PIN_BUZZER); }
+  else if (currentMenuPos == 2) { inSensorList = true; inMenu = false; currentSensorIdx = 0; }
+  else if (currentMenuPos == 3) { inAddMode = true; inMenu = false; tempPin = 4; }
+}
+
+void displayMainScreen() {
+  LCD_WriteCommand4Bits(0x80);
+  if (systemState == ALARM_DISARMED) LCD_WriteText("System OFF      ");
+  else if (systemState == ALARM_ARMED) LCD_WriteText("Czuwanie...     ");
+  else if (systemState == ALARM_TRIGGERED) LCD_WriteText("!!! ALARM !!!   ");
+  else if (systemState == ALARM_EXIT_DELAY) LCD_WriteText("WYJDZ! Czas:    ");
+  
+  LCD_WriteCommand4Bits(0xC0);
+  if (systemState == ALARM_EXIT_DELAY) {
+    LCD_WriteData4Bits('0' + (countdownValue / 10)); LCD_WriteData4Bits('0' + (countdownValue % 10)); LCD_WriteText(" sek          ");
+  } else if (systemState == ALARM_ARMED) {
+    LCD_WriteText("Ruchy: "); LCD_WriteData4Bits('0' + alarm_sense); LCD_WriteText("/3        "); 
+  } else LCD_WriteText("OK = Menu       ");
+}
+
+void displayAddScreen() {
+  LCD_WriteCommand4Bits(0x80); LCD_WriteText("WYBIERZ PIN:    ");
+  LCD_WriteCommand4Bits(0xC0); LCD_WriteText("PIN: ");
+  if (tempPin >= 14) {
+    LCD_WriteText("A"); LCD_WriteData4Bits('0' + (tempPin - 14)); LCD_WriteText("     ");
+  } else {
+    LCD_WriteData4Bits('0' + (tempPin / 10)); LCD_WriteData4Bits('0' + (tempPin % 10)); LCD_WriteText("      ");
+  }
+  LCD_WriteText("[OK]");
+}
+
+void displaySensorList() {
+  LCD_WriteCommand4Bits(0x80);
+  LCD_WriteText("TEST C"); LCD_WriteData4Bits('1' + currentSensorIdx);
+  LCD_WriteText(sensors[currentSensorIdx].violated ? " [!] " : " [OK]");
+  LCD_WriteCommand4Bits(0xC0);
+  LCD_WriteText("Pin:"); 
+  byte p = sensors[currentSensorIdx].pin;
+  if (p < 14) { LCD_WriteData4Bits('0' + (p/10)); LCD_WriteData4Bits('0' + (p%10)); } 
+  else { LCD_WriteText("A"); LCD_WriteData4Bits('0' + (p - 14)); }
+  LCD_WriteText(" OK=Wroc");
+}
+
+// TABELA BINARNA DLA DEKODERA CD4511
+void update7SegmentCD4511(int state) {
+  if (state == ALARM_DISARMED) {        // Stan 0 -> wyświetla cyfrę 0 (000)
+    digitalWrite(PIN_A, LOW);  
+    digitalWrite(PIN_B, LOW);  
+    digitalWrite(PIN_C, LOW); 
+  }
+  else if (state == ALARM_ARMED) {      // Stan 1 -> wyświetla cyfrę 1 (001)
+    digitalWrite(PIN_A, HIGH); 
+    digitalWrite(PIN_B, LOW);  
+    digitalWrite(PIN_C, LOW); 
+  }
+  else if (state == ALARM_EXIT_DELAY) { // Stan 2 -> wyświetla cyfrę 2 (010)
+    digitalWrite(PIN_A, LOW);  
+    digitalWrite(PIN_B, HIGH); 
+    digitalWrite(PIN_C, LOW); 
+  }
+  else if (state == ALARM_TRIGGERED) {  // Stan 3 -> wyświetla cyfrę 3 (011)
+    digitalWrite(PIN_A, HIGH); 
+    digitalWrite(PIN_B, HIGH); 
+    digitalWrite(PIN_C, LOW); 
+  }
+  else if (state == SENSOR_VIOLATED) {  // Stan 4 -> wyświetla cyfrę 4 (100)
+    digitalWrite(PIN_A, LOW);  
+    digitalWrite(PIN_B, LOW);  
+    digitalWrite(PIN_C, HIGH); 
+  }
+}
+
+void updateVisuals() {
+  update7SegmentCD4511(systemState);
+
+  panelLED.clear();
+  if (systemState == ALARM_DISARMED) panelLED.setPixelColor(0, panelLED.Color(0, 255, 0)); 
+  else if (systemState == ALARM_ARMED) panelLED.setPixelColor(1, panelLED.Color(0, 0, 255)); 
+  else if (systemState == ALARM_EXIT_DELAY) panelLED.setPixelColor(2, panelLED.Color(255, 100, 0)); 
+  else if (systemState == ALARM_TRIGGERED) panelLED.setPixelColor(3, panelLED.Color(255, 0, 0)); 
+  else if (systemState == SENSOR_VIOLATED) panelLED.setPixelColor(4, panelLED.Color(150, 0, 255)); 
+  panelLED.show();
+
+  if (systemState == ALARM_TRIGGERED) {
+    if (millis() - prevMillis > 250) {
+      prevMillis = millis(); blink = !blink;
+      digitalWrite(ledRed, blink ? LOW : HIGH); digitalWrite(ledBlue, blink ? HIGH : LOW);
+      if (blink) tone(PIN_BUZZER, 1800); else tone(PIN_BUZZER, 1200); 
+    }
+  } else if (systemState != ALARM_EXIT_DELAY) {
+    digitalWrite(ledRed, HIGH); digitalWrite(ledBlue, HIGH); noTone(PIN_BUZZER);
+  }
+}
+
+void displayMenu() {
+  LCD_WriteCommand4Bits(0x80); LCD_WriteText("--- MENU ---    ");
+  LCD_WriteCommand4Bits(0xC0);
+  const char* opts[] = {"> Uzbroj alarm ", "> Rozbroj alarm", "> Test czujnikow", "> Dodaj czujnik "};
+  LCD_WriteText(opts[currentMenuPos]);
+}
+
+void LCD_Write4Bits(byte d) {
+  digitalWrite(E, LOW); digitalWrite(DB4, d & 0x01); digitalWrite(DB5, d & 0x02);
+  digitalWrite(DB6, d & 0x04); digitalWrite(DB7, d & 0x08);
+  digitalWrite(E, HIGH); delay(2); digitalWrite(E, LOW); delay(2);
+}
+void LCD_WriteData4Bits(byte d) { digitalWrite(RS, HIGH); LCD_Write4Bits(d >> 4); LCD_Write4Bits(d & 0x0F); }
+void LCD_WriteCommand4Bits(byte d) { digitalWrite(RS, LOW); LCD_Write4Bits(d >> 4); LCD_Write4Bits(d & 0x0F); }
+void LCD_Init4bit() {
+  digitalWrite(RS, LOW); digitalWrite(E, LOW); delay(20);
+  LCD_Write4Bits(0x03); delay(5); LCD_Write4Bits(0x03); delay(2); LCD_Write4Bits(0x03); delay(2); LCD_Write4Bits(0x02);
+  LCD_WriteCommand4Bits(0x28); LCD_WriteCommand4Bits(0x0C); LCD_WriteCommand4Bits(0x01); LCD_WriteCommand4Bits(0x06);
+}
+void LCD_WriteText(const char *s) { while (*s) LCD_WriteData4Bits(*s++); }
